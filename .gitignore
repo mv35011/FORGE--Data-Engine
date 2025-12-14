@@ -1,1 +1,7 @@
 .venv/
+preannotation_pipeline/videos/
+preannotation_pipeline/models/
+preannotation_pipeline/rf-detr/rfdetr/outputs
+preannotation_pipeline/rf-detr/rfdetr/videos
+cleaning_seed_training/ppe_coco_format/
+cleaning_seed_training/ppe_coco_format.zip
