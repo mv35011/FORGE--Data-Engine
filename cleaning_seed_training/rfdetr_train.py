@@ -1,109 +1,174 @@
-import torch
-import os
+import argparse
+import datetime
 import random
-import glob
+import time
+from pathlib import Path
+import os
 import numpy as np
-from rfdetr import RFDETRBase
+import torch
+from torch.utils.data import DataLoader
 
-DATASET_DIR = "/workspace/dataset/ppe_coco_format"
-# Ensure this is on the persistent volume
-OUTPUT_DIR = "/workspace/rfdetr_output"
-
-
-def set_seed(seed=42):
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    # For deterministic behavior on CUDA
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+import util.misc as utils
+from datasets import build_dataset
+from engine import train_one_epoch, evaluate
+from models import build_model
 
 
-def validate_dataset_structure():
-    req = ["train", "valid"]
-    for split in req:
-        p = os.path.join(DATASET_DIR, split)
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"❌ Missing dataset split: {p}")
-    print("✅ Dataset structure valid.")
+# ----------------------------
+# ARGUMENTS (REAL Namespace)
+# ----------------------------
+def get_args():
+    parser = argparse.ArgumentParser("RF-DETR Finetuning (RunPod Safe)")
 
+    # Paths
+    parser.add_argument("--coco_path", default="dataset/ppe_coco_format")
+    parser.add_argument("--output_dir", default="rfdetr_output")
+    parser.add_argument("--resume", default="")
 
-def find_latest_checkpoint(output_dir):
-    """
-    Scans output directory for the latest checkpoint to auto-resume.
-    Assumes checkpoints are named like 'checkpoint_epoch_*.pt' or 'last.pt'
-    """
-    if not os.path.exists(output_dir):
-        return None
+    # Training
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--clip_max_norm", type=float, default=0.1)
 
-    # Standard RF-DETR/YOLO usually saves a 'last.pt' or 'last.pth'
-    last_ckpt = os.path.join(output_dir, "weights", "last.pt")
-    if os.path.exists(last_ckpt):
-        return last_ckpt
+    # Model
+    parser.add_argument("--num_classes", type=int, default=10)
+    parser.add_argument("--backbone", default="dinov2_windowed_small")
+    parser.add_argument("--num_queries", type=int, default=300)
 
-    # If not, look for epoch based checkpoints
-    checkpoints = glob.glob(os.path.join(output_dir, "*.pt"))
-    if not checkpoints:
-        return None
+    # System
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=0)  # IMPORTANT for RunPod
 
-    # Sort by modification time to get the newest one
-    latest_ckpt = max(checkpoints, key=os.path.getmtime)
-    return latest_ckpt
+    return parser.parse_args()
 
 
 def main():
-    set_seed()
-    validate_dataset_structure()
+    args = get_args()
+    utils.init_distributed_mode(args)
 
-    device_name = torch.cuda.get_device_name(0)
-    print(f"🔥 Starting Training on {device_name}")
-    print(f"📂 Output Directory: {OUTPUT_DIR}")
+    print(f"🚀 Starting RF-DETR Finetuning on {args.device}")
+    device = torch.device(args.device)
 
-    # Initialize Output Dir
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # Reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
-    # 1. Check for Auto-Resume
-    resume_path = find_latest_checkpoint(OUTPUT_DIR)
-    if resume_path:
-        print(f"♻️  Found existing checkpoint! Resuming from: {resume_path}")
-    else:
-        print("🆕 No checkpoint found. Starting fresh training.")
+    # ----------------------------
+    # Model
+    # ----------------------------
+    model, criterion, postprocessors = build_model(args)
+    model.to(device)
 
-    model = RFDETRBase(
-        size="large",
-        resolution=896,
-        gradient_checkpointing=True
+    model_without_ddp = model
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"📊 Trainable params: {n_params}")
+
+    # ----------------------------
+    # Optimizer
+    # ----------------------------
+    param_dicts = [
+        {
+            "params": [p for n, p in model_without_ddp.named_parameters()
+                       if "backbone" not in n and p.requires_grad]
+        },
+        {
+            "params": [p for n, p in model_without_ddp.named_parameters()
+                       if "backbone" in n and p.requires_grad],
+            "lr": args.lr * 0.1,
+        },
+    ]
+
+    optimizer = torch.optim.AdamW(
+        param_dicts, lr=args.lr, weight_decay=args.weight_decay
     )
 
-    try:
-        history = model.train(
-            dataset_dir=DATASET_DIR,
-            output_dir=OUTPUT_DIR,
-            epochs=25,
-            batch_size=4,  # WARNING: 896px is heavy. If OOM, reduce to 2.
-            grad_accum_steps=48,  # Effective batch = 4 * 48 = 192
-            lr=2e-4,
-            warmup_epochs=2,
-            lr_scheduler="cosine",
-            weight_decay=1e-4,
-            optimizer="adamw",
-            clip_grad_norm=1.0,
-            fp16=True,
-            num_workers=8,
-            checkpoint_interval=1,
-            save_best_model=True,
-            early_stopping=False,
-            resume=resume_path  # Pass the auto-detected path here
-        )
-        print("🏆 Training Complete.")
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=20, gamma=0.1
+    )
 
-    except RuntimeError as e:
-        if "out of memory" in str(e):
-            print("\n❌ CUDA OUT OF MEMORY ERROR ❌")
-            print("Your resolution (896) or Batch Size (4) is too high.")
-            print("Try reducing batch_size to 2 or resolution to 640.")
-        else:
-            raise e
+    # ----------------------------
+    # Dataset
+    # ----------------------------
+    dataset_train = build_dataset("train", args)
+    dataset_val = build_dataset("val", args)
+
+    data_loader_train = DataLoader(
+        dataset_train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=utils.collate_fn,
+        pin_memory=True,
+    )
+
+    data_loader_val = DataLoader(
+        dataset_val,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=utils.collate_fn,
+        pin_memory=True,
+    )
+
+    # ----------------------------
+    # Resume (SAFE)
+    # ----------------------------
+    start_epoch = 0
+    if args.resume and Path(args.resume).exists():
+        print(f"📥 Resuming from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location="cpu")
+
+        model_without_ddp.load_state_dict(checkpoint["model"], strict=False)
+
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "lr_scheduler" in checkpoint:
+            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"] + 1
+
+        print(f"✅ Resume OK. Starting from epoch {start_epoch}")
+
+    # ----------------------------
+    # Training Loop
+    # ----------------------------
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    start_time = time.time()
+
+    for epoch in range(start_epoch, args.epochs):
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train,
+            optimizer, device, epoch, args.clip_max_norm
+        )
+
+        lr_scheduler.step()
+
+        # Save checkpoint every epoch (RunPod-safe)
+        ckpt_path = output_dir / f"checkpoint_{epoch:04}.pth"
+        utils.save_on_master({
+            "model": model_without_ddp.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
+            "epoch": epoch,
+            "args": vars(args),
+        }, ckpt_path)
+
+        evaluate(
+            model, criterion, postprocessors,
+            data_loader_val, dataset_val,
+            device, output_dir
+        )
+
+        print(f"✅ Epoch {epoch} complete")
+
+    total_time = time.time() - start_time
+    print(f"🏁 Training finished in {datetime.timedelta(seconds=int(total_time))}")
 
 
 if __name__ == "__main__":
